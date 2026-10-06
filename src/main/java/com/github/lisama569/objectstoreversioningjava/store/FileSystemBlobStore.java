@@ -52,6 +52,12 @@ public class FileSystemBlobStore implements BlobStore {
      */
     volatile Consumer<Path> beforeCommitCorrupter;
 
+    /**
+     * 测试/故障注入钩子：物理删除 blob 之前被调用，可抛出运行时异常模拟删除失败
+     * （验证回收中途失败后重试不重复计数、不误删）。生产中始终为 null。
+     */
+    volatile Consumer<String> beforeDeleteHook;
+
     public FileSystemBlobStore(Path rootDir) {
         this.rootDir = rootDir;
         this.blobsDir = rootDir.resolve("blobs");
@@ -164,6 +170,9 @@ public class FileSystemBlobStore implements BlobStore {
     @Override
     public void delete(String blobId) {
         validateBlobId(blobId);
+        if (beforeDeleteHook != null) {
+            beforeDeleteHook.accept(blobId);
+        }
         try {
             boolean removed = Files.deleteIfExists(blobPath(blobId));
             log.info("blob physical-delete blobId={} removed={}", blobId, removed);

@@ -10,7 +10,11 @@ public class StoreException extends RuntimeException {
         NO_SUCH_OBJECT,
         NO_SUCH_VERSION,
         OBJECT_DELETED,
-        CHECKSUM_MISMATCH
+        CHECKSUM_MISMATCH,
+        /** 保留规则配置非法（负值、空规则、与最低保留要求冲突等）。 */
+        INVALID_RETENTION_POLICY,
+        /** 恢复目标版本的底层数据已被物理回收，无法恢复。 */
+        VERSION_DATA_RECLAIMED
     }
 
     private final Reason reason;
