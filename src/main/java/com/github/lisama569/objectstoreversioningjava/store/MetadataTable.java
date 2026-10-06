@@ -30,7 +30,11 @@ public class MetadataTable {
 
     private static final int STRIPES = 64;
 
+    /** 每 key 最多保留多少条“已裁剪版本”的元数据归档（仅元数据，不持有 blob 引用）。 */
+    private static final int MAX_ARCHIVED_PER_KEY = 256;
+
     private final ConcurrentHashMap<String, List<ObjectVersion>> table = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, List<ObjectVersion>> archived = new ConcurrentHashMap<>();
     private final ReentrantLock[] locks;
 
     public MetadataTable() {
@@ -72,6 +76,30 @@ public class MetadataTable {
     /** 取 key 当前版本链的不可变快照（按版本号升序）；key 不存在返回 null。 */
     public List<ObjectVersion> snapshot(String key) {
         return table.get(key);
+    }
+
+    /**
+     * 把被保留策略裁剪掉的版本元数据追加到归档（不持有 blob 引用）。
+     * 必须在同一 key 的分段锁内调用（由 {@link #mutate} 的回调触发），归档容量有限，
+     * 超出容量时丢弃最旧的归档条目。归档只用于恢复时给出可区分的失败原因。
+     */
+    public void archive(String key, List<ObjectVersion> pruned) {
+        if (pruned == null || pruned.isEmpty()) {
+            return;
+        }
+        List<ObjectVersion> merged = new ArrayList<>(
+                archived.getOrDefault(key, List.of()));
+        merged.addAll(pruned);
+        if (merged.size() > MAX_ARCHIVED_PER_KEY) {
+            merged = new ArrayList<>(merged.subList(merged.size() - MAX_ARCHIVED_PER_KEY, merged.size()));
+        }
+        archived.put(key, List.copyOf(merged));
+        log.debug("archive key={} archivedVersions={}", key, merged.size());
+    }
+
+    /** 取 key 的已裁剪版本归档快照（按版本号升序）；无归档返回空列表。 */
+    public List<ObjectVersion> archivedSnapshot(String key) {
+        return archived.getOrDefault(key, List.of());
     }
 
     /** 是否存在该 key（含只有删除标记的 key）。 */

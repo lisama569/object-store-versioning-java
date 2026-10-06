@@ -12,7 +12,7 @@ import org.springframework.context.annotation.Configuration;
 @EnableConfigurationProperties(ObjectStoreProperties.class)
 public class ObjectStoreConfiguration {
 
-    @Bean
+    @Bean(destroyMethod = "close")
     public ObjectStore objectStore(ObjectStoreProperties properties) {
         return new ObjectStore(properties);
     }

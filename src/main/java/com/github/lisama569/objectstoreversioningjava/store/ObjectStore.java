@@ -5,12 +5,16 @@ import com.github.lisama569.objectstoreversioningjava.exception.StoreException;
 import com.github.lisama569.objectstoreversioningjava.model.BlobContent;
 import com.github.lisama569.objectstoreversioningjava.model.ObjectVersion;
 import com.github.lisama569.objectstoreversioningjava.model.PutResult;
+import com.github.lisama569.objectstoreversioningjava.model.RetentionPolicy;
+import com.github.lisama569.objectstoreversioningjava.model.RestoreResult;
+import com.github.lisama569.objectstoreversioningjava.reclaim.SpaceReclaimer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 
@@ -26,8 +30,14 @@ import java.util.regex.Pattern;
  *       读取在元数据锁外取快照，再在“读门 + 读引脚”保护下读数据文件。</li>
  *   <li><b>删除</b>：删除即追加一个<b>删除标记版本</b>，历史数据版本仍可按版本号读取，
  *       直到超出版本保留上限被裁剪；删除后 get 报 {@code OBJECT_DELETED}，重新 put 可复活。</li>
+ *   <li><b>恢复</b>：{@link #restore(String, long)} 以指定历史版本的内容追加新版本，
+ *       恢复后 get 立即可读；底层数据已被物理回收时明确报 {@code VERSION_DATA_RECLAIMED}。</li>
+ *   <li><b>保留策略</b>：{@link #setRetentionPolicy(String, RetentionPolicy)} 支持按数量
+ *       （最多保留最近 N 版）与按时间（至少保留 T 毫秒）组合；不合法或与守卫下限冲突的规则
+ *       明确报 {@code INVALID_RETENTION_POLICY}。</li>
  *   <li><b>回收</b>：版本裁剪使 blob 引用计数归零后只登记待删，{@link #purgeUnreferenced()} 持写门
- *       物理删除，期间不可能有在途读；被多个版本共享的 blob 只要仍被引用就保留。</li>
+ *       物理删除，期间不可能有在途读；被多个版本共享的 blob 只要仍被引用就保留。
+ *       配置容量/比例阈值后由 {@code SpaceReclaimer} 在后台自动触发，写路径只投递信号不阻塞。</li>
  * </ul>
  */
 public class ObjectStore {
@@ -40,21 +50,40 @@ public class ObjectStore {
     private final ObjectStoreProperties properties;
     private final int maxVersionsPerKey;
     private final boolean autoPurge;
+    private final int retentionMinVersions;
+    private final long retentionMinRetentionMillis;
     private final BlobStore blobStore;
     private final BlobRegistry registry;
     private final MetadataTable table;
+    private final ConcurrentHashMap<String, RetentionPolicy> policies = new ConcurrentHashMap<>();
+    private final SpaceReclaimer reclaimer;
     private final AtomicLong versionSequence = new AtomicLong(0);
 
     public ObjectStore(ObjectStoreProperties properties) {
         this.properties = properties;
         this.maxVersionsPerKey = properties.getMaxVersionsPerKey();
         this.autoPurge = properties.isAutoPurge();
+        this.retentionMinVersions = properties.getRetentionMinVersions();
+        this.retentionMinRetentionMillis = properties.getRetentionMinRetentionMillis();
+        if (retentionMinVersions < 1) {
+            throw new IllegalArgumentException(
+                    "object-store.retention-min-versions must be >= 1, got " + retentionMinVersions);
+        }
+        if (retentionMinRetentionMillis < 0) {
+            throw new IllegalArgumentException(
+                    "object-store.retention-min-retention-millis must be >= 0, got "
+                            + retentionMinRetentionMillis);
+        }
         this.blobStore = new FileSystemBlobStore(properties.getDataDir());
         this.registry = new BlobRegistry(blobStore);
         this.table = new MetadataTable();
-        log.info("ObjectStore ready, dataDir={} maxVersionsPerKey={} autoPurge={}",
+        this.reclaimer = new SpaceReclaimer(properties, registry, this::enforceRetentionNow);
+        log.info("ObjectStore ready, dataDir={} maxVersionsPerKey={} autoPurge={} "
+                        + "retentionGuards={}versions/{}ms reclaimThresholds={}",
                 properties.getDataDir().toAbsolutePath(),
-                maxVersionsPerKey <= 0 ? "UNLIMITED" : maxVersionsPerKey, autoPurge);
+                maxVersionsPerKey <= 0 ? "UNLIMITED" : maxVersionsPerKey, autoPurge,
+                retentionMinVersions, retentionMinRetentionMillis,
+                reclaimer.thresholdsEnabled() ? "ENABLED" : "DISABLED");
     }
 
     /**
@@ -72,13 +101,14 @@ public class ObjectStore {
         // 持读门完成“发布 blob 文件 + 提交元数据 + 引用计数”临界序列：
         // GC 物理回收持写门，无法在文件已发布但引用尚未登记的窗口里删除文件（含待删 blob 被救回的情形）。
         registry.readLock();
+        PutResult result;
         try {
             boolean existed = blobStore.exists(calculateBlobId(content));
             String blobId = blobStore.put(content);
             long versionId = versionSequence.incrementAndGet();
             long now = System.currentTimeMillis();
 
-            PutResult result = table.mutate(key, current -> {
+            result = table.mutate(key, current -> {
                 List<ObjectVersion> next = new ArrayList<>(current == null ? List.of() : current);
                 ObjectVersion version = new ObjectVersion(versionId, blobId, content.remaining(),
                         blobId, now, false);
@@ -91,17 +121,18 @@ public class ObjectStore {
                         key, versionId, blobId, content.remaining(), dedup, next.size());
                 return new MetadataTable.Mutation<>(next, new PutResult(versionId, blobId, dedup));
             });
-
-            if (autoPurge) {
-                int removed = registry.purgeUnreferenced();
-                if (removed > 0) {
-                    log.info("auto-purge after put key={} removed={}", key, removed);
-                }
-            }
-            return result;
         } finally {
             registry.readUnlock();
         }
+        // 物理回收持写门，必须在读门之外执行（读锁不可升级为写锁，门内调用会自死锁）。
+        if (autoPurge) {
+            int removed = registry.purgeUnreferenced().removed();
+            if (removed > 0) {
+                log.info("auto-purge after put key={} removed={}", key, removed);
+            }
+        }
+        reclaimer.triggerAsync();
+        return result;
     }
 
     /**
@@ -175,8 +206,9 @@ public class ObjectStore {
     public ObjectVersion delete(String key) {
         validateKey(key);
         registry.readLock();
+        ObjectVersion marker;
         try {
-            ObjectVersion marker = table.mutate(key, current -> {
+            marker = table.mutate(key, current -> {
                 if (current == null || current.isEmpty()) {
                     log.warn("delete rejected key={} reason=NO_SUCH_OBJECT", key);
                     throw new StoreException(StoreException.Reason.NO_SUCH_OBJECT,
@@ -200,13 +232,15 @@ public class ObjectStore {
                         key, versionId, pruned.size(), next.size());
                 return new MetadataTable.Mutation<>(next, m);
             });
-            if (autoPurge) {
-                registry.purgeUnreferenced();
-            }
-            return marker;
         } finally {
             registry.readUnlock();
         }
+        // 物理回收持写门，必须在读门之外执行（读锁不可升级为写锁，门内调用会自死锁）。
+        if (autoPurge) {
+            registry.purgeUnreferenced();
+        }
+        reclaimer.triggerAsync();
+        return marker;
     }
 
     /** 返回某 key 的版本链（不可变快照，含删除标记）。 */
@@ -222,9 +256,193 @@ public class ObjectStore {
 
     /** 物理回收所有无引用 blob，返回删除数量。 */
     public int purgeUnreferenced() {
-        int removed = registry.purgeUnreferenced();
+        int removed = registry.purgeUnreferenced().removed();
         log.info("manual purge removed={} blobs, trackedKeys={}", removed, table.size());
         return removed;
+    }
+
+    // ---- 保留策略 ----
+
+    /**
+     * 为某个对象设置保留规则。规则立即生效：已超出规则的旧版本会被就地裁剪。
+     * 规则不合法或与最低保留要求冲突时抛 {@code INVALID_RETENTION_POLICY}，不套用任何默认值。
+     */
+    public void setRetentionPolicy(String key, RetentionPolicy policy) {
+        validateKey(key);
+        if (policy == null) {
+            throw new StoreException(StoreException.Reason.INVALID_RETENTION_POLICY,
+                    "retention policy must not be null; use clearRetentionPolicy to remove it");
+        }
+        policy.validate(retentionMinVersions, retentionMinRetentionMillis);
+        policies.put(key, policy);
+        log.info("retention policy set key={} maxVersions={} minRetention={}ms "
+                        + "(guards: {}versions/{}ms)",
+                key, policy.maxVersions() <= 0 ? "UNLIMITED" : policy.maxVersions(),
+                policy.minRetentionMillis(), retentionMinVersions, retentionMinRetentionMillis);
+        // 立即按新规则裁剪已有版本。
+        registry.readLock();
+        try {
+            table.mutate(key, current -> {
+                if (current == null) {
+                    return new MetadataTable.Mutation<>(null, null);
+                }
+                List<ObjectVersion> next = new ArrayList<>(current);
+                prune(key, next);
+                return new MetadataTable.Mutation<>(next, null);
+            });
+        } finally {
+            registry.readUnlock();
+        }
+    }
+
+    /** 返回某 key 当前生效的保留规则（per-key 覆盖优先，否则为全局默认）。 */
+    public RetentionPolicy retentionPolicy(String key) {
+        validateKey(key);
+        return effectivePolicy(key);
+    }
+
+    /** 移除某 key 的 per-key 保留规则，回落到全局默认。 */
+    public void clearRetentionPolicy(String key) {
+        validateKey(key);
+        if (policies.remove(key) != null) {
+            log.info("retention policy cleared key={}, falling back to global default", key);
+        }
+    }
+
+    private RetentionPolicy effectivePolicy(String key) {
+        RetentionPolicy policy = policies.get(key);
+        if (policy != null) {
+            return policy;
+        }
+        return new RetentionPolicy(Math.max(maxVersionsPerKey, 0), 0L);
+    }
+
+    // ---- 删除恢复 ----
+
+    /**
+     * 把对象恢复到指定历史版本：以该版本的内容追加一个<b>新版本</b>（不是回滚，
+     * 历史版本链保持连续），恢复后 {@link #get(String)} 即可读到该内容。
+     *
+     * @throws StoreException NO_SUCH_OBJECT（key 不存在）/
+     *                        NO_SUCH_VERSION（版本从未存在或归档已溢出）/
+     *                        OBJECT_DELETED（目标版本是删除标记）/
+     *                        VERSION_DATA_RECLAIMED（版本元数据尚在归档，但底层数据已被物理回收）
+     */
+    public RestoreResult restore(String key, long targetVersionId) {
+        validateKey(key);
+        registry.readLock();
+        RestoreResult result;
+        try {
+            result = table.mutate(key, current -> {
+                if (current == null || current.isEmpty()) {
+                    log.warn("restore rejected key={} targetVersion={} reason=NO_SUCH_OBJECT",
+                            key, targetVersionId);
+                    throw new StoreException(StoreException.Reason.NO_SUCH_OBJECT,
+                            "object does not exist: " + key);
+                }
+                ObjectVersion target = null;
+                for (ObjectVersion v : current) {
+                    if (v.versionId() == targetVersionId) {
+                        target = v;
+                        break;
+                    }
+                }
+                boolean fromArchive = false;
+                if (target == null) {
+                    for (ObjectVersion v : table.archivedSnapshot(key)) {
+                        if (v.versionId() == targetVersionId) {
+                            target = v;
+                            fromArchive = true;
+                            break;
+                        }
+                    }
+                }
+                if (target == null) {
+                    log.warn("restore rejected key={} targetVersion={} reason=NO_SUCH_VERSION",
+                            key, targetVersionId);
+                    throw new StoreException(StoreException.Reason.NO_SUCH_VERSION,
+                            "version " + targetVersionId + " does not exist for key: " + key
+                                    + " (it was never created or its archived metadata has expired)");
+                }
+                if (target.deleteMarker()) {
+                    log.warn("restore rejected key={} targetVersion={} reason=OBJECT_DELETED "
+                                    + "(cannot restore to a delete marker)", key, targetVersionId);
+                    throw new StoreException(StoreException.Reason.OBJECT_DELETED,
+                            "version " + targetVersionId + " is a delete marker of key: " + key
+                                    + "; restore target must be a data version");
+                }
+                if (fromArchive) {
+                    // 已裁剪版本：blob 可能仍在（被其他版本引用或待删未清），也可能已被物理回收。
+                    if (!registry.tryAcquireIfPresent(target.blobId())) {
+                        log.warn("restore rejected key={} targetVersion={} blobId={} "
+                                        + "reason=VERSION_DATA_RECLAIMED",
+                                key, targetVersionId, target.blobId());
+                        throw new StoreException(StoreException.Reason.VERSION_DATA_RECLAIMED,
+                                "cannot restore key " + key + " to version " + targetVersionId
+                                        + ": underlying blob " + target.blobId()
+                                        + " has been physically reclaimed");
+                    }
+                } else {
+                    // 新版本与目标版本共享同一 blob。
+                    registry.acquire(target.blobId());
+                }
+                long newVersionId = versionSequence.incrementAndGet();
+                ObjectVersion restored = new ObjectVersion(newVersionId, target.blobId(),
+                        target.size(), target.checksum(), System.currentTimeMillis(), false);
+                List<ObjectVersion> next = new ArrayList<>(current);
+                next.add(restored);
+                prune(key, next);
+                log.info("restore key={} fromVersion={} newVersion={} blobId={} fromArchive={}",
+                        key, targetVersionId, newVersionId, target.blobId(), fromArchive);
+                return new MetadataTable.Mutation<>(next,
+                        new RestoreResult(newVersionId, targetVersionId, target.blobId()));
+            });
+        } finally {
+            registry.readUnlock();
+        }
+        // 物理回收持写门，必须在读门之外执行（读锁不可升级为写锁，门内调用会自死锁）。
+        if (autoPurge) {
+            registry.purgeUnreferenced();
+        }
+        reclaimer.triggerAsync();
+        return result;
+    }
+
+    /**
+     * 对所有 key 强制执行一次保留策略裁剪（时间规则随时间推移才会裁出新版本）。
+     * 由空间回收器在阈值越界时调用，也可手动触发。返回裁剪掉的版本总数。
+     */
+    public int enforceRetentionNow() {
+        int total = 0;
+        for (String key : table.keys()) {
+            registry.readLock();
+            try {
+                total += table.mutate(key, current -> {
+                    if (current == null) {
+                        return new MetadataTable.Mutation<>(null, 0);
+                    }
+                    List<ObjectVersion> next = new ArrayList<>(current);
+                    List<ObjectVersion> pruned = prune(key, next);
+                    return new MetadataTable.Mutation<>(next, pruned.size());
+                });
+            } finally {
+                registry.readUnlock();
+            }
+        }
+        if (total > 0) {
+            log.info("enforceRetentionNow pruned={} versions across all keys", total);
+        }
+        return total;
+    }
+
+    /** 空间回收器入口（阈值检查 + 必要时回收），供测试与运维手动触发。 */
+    public SpaceReclaimer reclaimer() {
+        return reclaimer;
+    }
+
+    /** 关闭后台回收线程。 */
+    public void close() {
+        reclaimer.close();
     }
 
     // ---- internals ----
@@ -262,23 +480,47 @@ public class ObjectStore {
     }
 
     /**
-     * 按保留上限裁剪版本链（原地删除 list 头部多余元素），并同步释放被裁版本的 blob 引用。
+     * 按有效保留策略裁剪版本链：一个历史版本只有在“数量规则”和“时间规则”都允许回收时
+     * 才会被裁掉；链尾最新版本永不裁剪。被裁版本的 blob 引用立即释放（登记待删），
+     * 版本元数据进入归档，供 restore 给出可区分的失败原因。
      * 必须在该 key 的元数据分段锁内调用。
+     *
+     * @return 被裁剪的版本列表
      */
     private List<ObjectVersion> prune(String key, List<ObjectVersion> versions) {
-        List<ObjectVersion> pruned = List.of();
-        if (maxVersionsPerKey > 0 && versions.size() > maxVersionsPerKey) {
-            int drop = versions.size() - maxVersionsPerKey;
-            pruned = List.copyOf(versions.subList(0, drop));
-            versions.subList(0, drop).clear();
-            for (ObjectVersion v : pruned) {
-                if (!v.deleteMarker()) {
-                    registry.release(v.blobId());
-                }
-            }
-            log.info("retention prune key={} droppedVersions={} maxVersions={}",
-                    key, pruned.stream().map(ObjectVersion::versionId).toList(), maxVersionsPerKey);
+        RetentionPolicy policy = effectivePolicy(key);
+        if (policy.isUnlimited() || versions.size() <= 1) {
+            return List.of();
         }
+        long now = System.currentTimeMillis();
+        int size = versions.size();
+        List<ObjectVersion> pruned = new ArrayList<>();
+        // 链尾（最新版本）不参与裁剪，保证对象当前状态始终可解释。
+        for (int i = 0; i < size - 1; i++) {
+            ObjectVersion v = versions.get(i);
+            boolean keptByCount = policy.maxVersions() > 0 && i >= size - policy.maxVersions();
+            boolean keptByTime = policy.minRetentionMillis() > 0
+                    && now - v.createdAt() < policy.minRetentionMillis();
+            if (!keptByCount && !keptByTime) {
+                pruned.add(v);
+            }
+        }
+        if (pruned.isEmpty()) {
+            return List.of();
+        }
+        versions.removeAll(pruned);
+        for (ObjectVersion v : pruned) {
+            if (!v.deleteMarker()) {
+                registry.release(v.blobId());
+            }
+        }
+        table.archive(key, pruned);
+        log.info("retention prune key={} policy=[maxVersions={}, minRetention={}ms] "
+                        + "prunedVersions={} retainedVersions={}",
+                key, policy.maxVersions() <= 0 ? "UNLIMITED" : policy.maxVersions(),
+                policy.minRetentionMillis(),
+                pruned.stream().map(ObjectVersion::versionId).toList(),
+                versions.stream().map(ObjectVersion::versionId).toList());
         return pruned;
     }
 

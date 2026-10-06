@@ -161,9 +161,18 @@ public class FileSystemBlobStore implements BlobStore {
         return new BlobContent(ByteBuffer.wrap(bytes), bytes.length, actualId);
     }
 
+    /**
+     * 测试/故障注入钩子：物理删除某个 blob 之前被调用（可抛出异常模拟删除失败，
+     * 验证回收中途失败后的可重试性）。生产中始终为 null。
+     */
+    volatile Consumer<String> beforeDeleteHook;
+
     @Override
     public void delete(String blobId) {
         validateBlobId(blobId);
+        if (beforeDeleteHook != null) {
+            beforeDeleteHook.accept(blobId);
+        }
         try {
             boolean removed = Files.deleteIfExists(blobPath(blobId));
             log.info("blob physical-delete blobId={} removed={}", blobId, removed);

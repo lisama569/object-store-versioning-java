@@ -24,6 +24,32 @@ final class TestSupport {
         return new ObjectStore(props);
     }
 
+    static ObjectStore newStoreWithGuards(int maxVersions, boolean autoPurge,
+                                          int retentionMinVersions,
+                                          long retentionMinRetentionMillis) throws IOException {
+        Path dir = Files.createTempDirectory("ostore-test-");
+        ObjectStoreProperties props = new ObjectStoreProperties();
+        props.setDataDir(dir);
+        props.setMaxVersionsPerKey(maxVersions);
+        props.setAutoPurge(autoPurge);
+        props.setRetentionMinVersions(retentionMinVersions);
+        props.setRetentionMinRetentionMillis(retentionMinRetentionMillis);
+        return new ObjectStore(props);
+    }
+
+    static ObjectStore newStoreWithReclaim(int maxVersions, boolean autoPurge,
+                                           long reclaimMaxDiskBytes,
+                                           double reclaimMaxUsageRatio) throws IOException {
+        Path dir = Files.createTempDirectory("ostore-test-");
+        ObjectStoreProperties props = new ObjectStoreProperties();
+        props.setDataDir(dir);
+        props.setMaxVersionsPerKey(maxVersions);
+        props.setAutoPurge(autoPurge);
+        props.setReclaimMaxDiskBytes(reclaimMaxDiskBytes);
+        props.setReclaimMaxUsageRatio(reclaimMaxUsageRatio);
+        return new ObjectStore(props);
+    }
+
     static ByteBuffer bytes(String s) {
         return ByteBuffer.wrap(s.getBytes(StandardCharsets.UTF_8));
     }
